@@ -144,7 +144,105 @@ def designation_variants(name: str) -> list[str]:
         variants.add("ГОСТ Р " + norm)
 
     return list(variants)
+# ---------------------------------------------------------------------------
+# ПОИСК САМОЙ СВЕЖЕЙ ВЕРСИИ
+# ---------------------------------------------------------------------------
 
+YEAR_RE = re.compile(r"-(\d{2,4})$")
+
+
+def parse_designation(name: str) -> tuple[str, str | None]:
+    """
+    Разбирает обозначение на базу и год.
+    'ГОСТ Р 2.105'         -> ('ГОСТ Р 2.105', None)
+    'ГОСТ Р 2.105-2019'    -> ('ГОСТ Р 2.105', '2019')
+    'ГОСТ 2.105-95'        -> ('ГОСТ 2.105', '95')
+    """
+    norm = normalize_designation(name)
+    m = YEAR_RE.search(norm)
+    if not m:
+        return norm, None
+    year = m.group(1)
+    base = norm[: m.start()].strip()
+    return base, year
+
+
+def expand_base_variants(base: str) -> list[str]:
+    """
+    Возвращает все разумные варианты базы (без года):
+    с/без «Р», МЭК/IEC, ИСО/ISO, ЕН/EN.
+    """
+    variants = {base}
+
+    # ГОСТ <-> ГОСТ Р
+    if base.startswith("ГОСТ Р "):
+        variants.add(base.replace("ГОСТ Р ", "ГОСТ ", 1))
+    elif base.startswith("ГОСТ "):
+        variants.add(base.replace("ГОСТ ", "ГОСТ Р ", 1))
+
+    # Аббревиатуры
+    replacements = [
+        ("МЭК", "IEC"), ("IEC", "МЭК"),
+        ("ИСО", "ISO"), ("ISO", "ИСО"),
+        ("ЕН", "EN"),   ("EN", "ЕН"),
+    ]
+    current = list(variants)
+    for v in current:
+        for rus, lat in replacements:
+            if rus in v:
+                new_v = v.replace(rus, lat)
+                variants.add(new_v)
+                if new_v.startswith("ГОСТ Р "):
+                    variants.add(new_v.replace("ГОСТ Р ", "ГОСТ ", 1))
+                elif new_v.startswith("ГОСТ "):
+                    variants.add(new_v.replace("ГОСТ ", "ГОСТ Р ", 1))
+
+    return list(variants)
+
+
+def find_newest_match(name: str, index: dict) -> tuple[str, str | None, list[str]]:
+    """
+    Ищет в индексе самый свежий стандарт по обозначению.
+    Возвращает (matched_key, page_url, список_всех_годов).
+    Если ничего не найдено — (None, None, []).
+    """
+    base, explicit_year = parse_designation(name)
+
+    # Если год указан явно — ищем ровно этот вариант
+    if explicit_year is not None:
+        for candidate in expand_base_variants(base):
+            key = f"{candidate}-{explicit_year}"
+            if key in index:
+                return key, index[key], [explicit_year]
+        return None, None, []
+
+    # Год не указан — ищем ВСЕ версии и берём самую свежую
+    candidates: dict[str, str] = {}  # year -> key
+    for variant in expand_base_variants(base):
+        prefix = variant + "-"
+        for key, url in index.items():
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix):]
+            # Год — это последние цифры без дефисов
+            if not rest.isdigit():
+                continue
+            # Нормализуем 2-значные годы: 95 -> 1995, 02 -> 2002, 19 -> 2019
+            if len(rest) == 2:
+                y2 = int(rest)
+                year_norm = str(1900 + y2) if y2 >= 70 else str(2000 + y2)
+            else:
+                year_norm = rest
+            if year_norm not in candidates:
+                candidates[year_norm] = key
+
+    if not candidates:
+        return None, None, []
+
+    years_sorted = sorted(candidates.keys())
+    newest_year = years_sorted[-1]
+    newest_key = candidates[newest_year]
+    return newest_key, index[newest_key], years_sorted
 
 # ---------------------------------------------------------------------------
 # HTTP
