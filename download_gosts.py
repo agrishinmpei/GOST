@@ -4,15 +4,18 @@
 """
 Скрипт для скачивания ГОСТ и ГОСТ Р с сайта meganorm.ru по списку из TXT-файла.
 
-Разделы сайта (ГОСТ и ГОСТ Р) определяются автоматически: скрипт сканирует
-все секции каталога /list/N-*.htm и строит единый индекс, в котором ключом
-является полное обозначение стандарта ("ГОСТ 1.0-92", "ГОСТ Р 50571.1-2009").
+Особенности:
+  - Автоматически определяет раздел сайта (ГОСТ или ГОСТ Р).
+  - Если год НЕ указан — скачивает самую свежую версию стандарта.
+  - Если год указан явно — скачивает ровно эту версию.
+  - Учитывает варианты написания: ГОСТ/ГОСТ Р, МЭК/IEC, ИСО/ISO, ЕН/EN.
 
-Пользователю достаточно в TXT-файле написать полное обозначение, например:
+Формат TXT-файла — одно обозначение на строку, год можно не указывать:
 
-    ГОСТ 1.0-92
-    ГОСТ Р 50571.1-2009
-    ГОСТ Р ИСО 9001-2015
+    ГОСТ 2.105
+    ГОСТ Р 50571.1
+    ГОСТ Р МЭК 60950-1
+    ГОСТ 8.417-2002     (если нужна конкретная версия)
 
 Запуск:
     pip install requests beautifulsoup4
@@ -35,13 +38,13 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://meganorm.ru"
 DOWNLOAD_DIR = "downloads"
-INDEX_CACHE = "index_cache.json"   # кэш индекса, чтобы не сканировать сайт повторно
+INDEX_CACHE = "index_cache.json"
 
-SECTIONS_TO_SCAN = range(1, 60)    # попробуем секции 1..20
-MAX_PAGES_PER_SECTION = 80         # максимум страниц в одной секции
-EMPTY_PAGE_LIMIT = 3               # 3 пустых страницы подряд = конец секции
+SECTIONS_TO_SCAN = range(1, 60)    # сканируем секции 1..59
+MAX_PAGES_PER_SECTION = 80
+EMPTY_PAGE_LIMIT = 3
 
-REQUEST_DELAY = 0.5                # пауза между запросами (сек)
+REQUEST_DELAY = 0.5
 REQUEST_TIMEOUT = 30
 
 HEADERS = {
@@ -53,23 +56,24 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
 }
 
-# Регулярное выражение для извлечения обозначения из текста ссылки.
-# Захватывает: "ГОСТ 1.0-92", "ГОСТ Р 50571.1-2009",
-#              "ГОСТ Р ИСО 9001-2015", "ГОСТ Р МЭК 60950-1-2014",
-#              "ГОСТ 8.417-2002" и т.п.
+# Извлекает обозначение из текста ссылки на каталоге.
+# Захватывает "ГОСТ 1.0-92", "ГОСТ Р 50571.1-2009",
+# "ГОСТ Р ИСО 9001-2015", "ГОСТ Р МЭК 60950-1-2014", "ГОСТ IEC 60950-1-2014".
 DESIGNATION_RE = re.compile(
     r"""
     ^\s*
     (
         ГОСТ(?:\s+Р)?
-        (?:\s+(?:ИСО|МЭК|ЕН))?       # необязательная серия
+        (?:\s+(?:ИСО|МЭК|ЕН|ISO|IEC|EN))?
         \s+
-        [\d\.\-]+                    # номер, точки и дефисы
-        (?:-\d{2,4})?                # необязательный год
+        [\d\.\-\/]+
+        (?:-\d{2,4})?
     )
     """,
     re.VERBOSE | re.IGNORECASE,
 )
+
+YEAR_RE = re.compile(r"-(\d{2,4})$")
 
 # ---------------------------------------------------------------------------
 # НОРМАЛИЗАЦИЯ
@@ -96,145 +100,120 @@ def extract_designation(text: str) -> str:
     return text.strip()
 
 
-def designation_variants(name: str) -> list[str]:
-    """
-    Возвращает список вариантов обозначения для поиска в индексе.
-    Учитывает:
-      - ГОСТ <-> ГОСТ Р
-      - МЭК <-> IEC
-      - ИСО <-> ISO
-      - ЕН  <-> EN
-    """
-    norm = normalize_designation(name)
-    if not norm:
-        return []
-
-    variants = set()
-    variants.add(norm)
-
-    # 1. ГОСТ <-> ГОСТ Р
-    if norm.startswith("ГОСТ Р "):
-        variants.add(norm.replace("ГОСТ Р ", "ГОСТ ", 1))
-    elif norm.startswith("ГОСТ "):
-        variants.add(norm.replace("ГОСТ ", "ГОСТ Р ", 1))
-
-    # 2. Аббревиатуры МЭК/IEC, ИСО/ISO, ЕН/EN
-    replacements = [
-        ("МЭК", "IEC"), ("IEC", "МЭК"),
-        ("ИСО", "ISO"), ("ISO", "ИСО"),
-        ("ЕН", "EN"),  ("EN", "ЕН"),
-    ]
-
-    # Применяем замены ко всем уже накопленным вариантам
-    current = list(variants)
-    for variant in current:
-        for rus, lat in replacements:
-            if rus in variant:
-                new_variant = variant.replace(rus, lat)
-                variants.add(new_variant)
-                # и ещё раз с добавлением/удалением «Р»
-                if new_variant.startswith("ГОСТ Р "):
-                    variants.add(new_variant.replace("ГОСТ Р ", "ГОСТ ", 1))
-                elif new_variant.startswith("ГОСТ "):
-                    variants.add(new_variant.replace("ГОСТ ", "ГОСТ Р ", 1))
-
-    # 3. Если пользователь написал без префикса — добавим оба
-    if not norm.startswith("ГОСТ"):
-        variants.add("ГОСТ " + norm)
-        variants.add("ГОСТ Р " + norm)
-
-    return list(variants)
 # ---------------------------------------------------------------------------
-# ПОИСК САМОЙ СВЕЖЕЙ ВЕРСИИ
+# ВАРИАНТЫ НАПИСАНИЯ
 # ---------------------------------------------------------------------------
 
-YEAR_RE = re.compile(r"-(\d{2,4})$")
-
-
-def parse_designation(name: str) -> tuple[str, str | None]:
-    """
-    Разбирает обозначение на базу и год.
-    'ГОСТ Р 2.105'         -> ('ГОСТ Р 2.105', None)
-    'ГОСТ Р 2.105-2019'    -> ('ГОСТ Р 2.105', '2019')
-    'ГОСТ 2.105-95'        -> ('ГОСТ 2.105', '95')
-    """
-    norm = normalize_designation(name)
-    m = YEAR_RE.search(norm)
-    if not m:
-        return norm, None
-    year = m.group(1)
-    base = norm[: m.start()].strip()
-    return base, year
+ABBREV_REPLACEMENTS = [
+    ("МЭК", "IEC"), ("IEC", "МЭК"),
+    ("ИСО", "ISO"), ("ISO", "ИСО"),
+    ("ЕН", "EN"),   ("EN", "ЕН"),
+]
 
 
 def expand_base_variants(base: str) -> list[str]:
     """
     Возвращает все разумные варианты базы (без года):
     с/без «Р», МЭК/IEC, ИСО/ISO, ЕН/EN.
+    База всегда идёт первой в списке.
     """
-    variants = {base}
+    variants_set = {base}
 
     # ГОСТ <-> ГОСТ Р
     if base.startswith("ГОСТ Р "):
-        variants.add(base.replace("ГОСТ Р ", "ГОСТ ", 1))
+        variants_set.add(base.replace("ГОСТ Р ", "ГОСТ ", 1))
     elif base.startswith("ГОСТ "):
-        variants.add(base.replace("ГОСТ ", "ГОСТ Р ", 1))
+        variants_set.add(base.replace("ГОСТ ", "ГОСТ Р ", 1))
 
     # Аббревиатуры
-    replacements = [
-        ("МЭК", "IEC"), ("IEC", "МЭК"),
-        ("ИСО", "ISO"), ("ISO", "ИСО"),
-        ("ЕН", "EN"),   ("EN", "ЕН"),
-    ]
-    current = list(variants)
+    current = list(variants_set)
     for v in current:
-        for rus, lat in replacements:
+        for rus, lat in ABBREV_REPLACEMENTS:
             if rus in v:
                 new_v = v.replace(rus, lat)
-                variants.add(new_v)
+                variants_set.add(new_v)
                 if new_v.startswith("ГОСТ Р "):
-                    variants.add(new_v.replace("ГОСТ Р ", "ГОСТ ", 1))
+                    variants_set.add(new_v.replace("ГОСТ Р ", "ГОСТ ", 1))
                 elif new_v.startswith("ГОСТ "):
-                    variants.add(new_v.replace("ГОСТ ", "ГОСТ Р ", 1))
+                    variants_set.add(new_v.replace("ГОСТ ", "ГОСТ Р ", 1))
 
-    return list(variants)
+    others = sorted(v for v in variants_set if v != base)
+    return [base] + others
 
 
-def find_newest_match(name: str, index: dict) -> tuple[str, str | None, list[str]]:
+def parse_designation(name: str) -> tuple[str, str | None]:
     """
-    Ищет в индексе самый свежий стандарт по обозначению.
-    Возвращает (matched_key, page_url, список_всех_годов).
+    Разбирает обозначение на (база, год).
+    'ГОСТ Р 2.105'          -> ('ГОСТ Р 2.105', None)
+    'ГОСТ Р 2.105-2019'     -> ('ГОСТ Р 2.105', '2019')
+    'ГОСТ 2.105-95'         -> ('ГОСТ 2.105', '95')
+    'ГОСТ IEC 60950-21'     -> ('ГОСТ IEC 60950-21', None)   # -21 это не год
+    'ГОСТ IEC 60950-21-2013'-> ('ГОСТ IEC 60950-21', '2013')
+    """
+    norm = normalize_designation(name)
+    m = YEAR_RE.search(norm)
+    if not m:
+        return norm, None
+
+    year = m.group(1)
+    base = norm[: m.start()].strip()
+
+    # Защита: двухзначное число в конце — это, скорее всего, часть номера
+    # стандарта (как -21 в 60950-21), а не год, если в номере нет точек.
+    if len(year) == 2 and "." not in base:
+        return norm, None
+
+    return base, year
+
+
+def _normalize_year(y: str) -> str:
+    """95 -> 1995, 02 -> 2002, 2019 -> 2019."""
+    if len(y) == 2:
+        n = int(y)
+        return str(1900 + n) if n >= 70 else str(2000 + n)
+    return y
+
+
+# ---------------------------------------------------------------------------
+# ПОИСК САМОЙ СВЕЖЕЙ ВЕРСИИ
+# ---------------------------------------------------------------------------
+
+def find_newest_match(name: str, index: dict) -> tuple[str | None, str | None, list[str]]:
+    """
+    Ищет в индексе подходящий стандарт.
+      - Если год указан явно — ищет ровно эту версию.
+      - Если год не указан — ищет ВСЕ версии (включая варианты написания)
+        и возвращает самую свежую по году.
+    Возвращает (matched_key, page_url, отсортированный_список_годов).
     Если ничего не найдено — (None, None, []).
     """
     base, explicit_year = parse_designation(name)
+    base_variants = expand_base_variants(base)
 
-    # Если год указан явно — ищем ровно этот вариант
+    # --- Явно указанный год ---
     if explicit_year is not None:
-        for candidate in expand_base_variants(base):
-            key = f"{candidate}-{explicit_year}"
-            if key in index:
-                return key, index[key], [explicit_year]
+        year_norm = _normalize_year(explicit_year)
+        for variant in base_variants:
+            for y in {explicit_year, year_norm}:
+                key = f"{variant}-{y}"
+                if key in index:
+                    return key, index[key], [year_norm]
         return None, None, []
 
-    # Год не указан — ищем ВСЕ версии и берём самую свежую
-    candidates: dict[str, str] = {}  # year -> key
-    for variant in expand_base_variants(base):
+    # --- Год не указан: ищем самый свежий ---
+    candidates: dict[str, str] = {}  # нормализованный год -> ключ
+    for variant in base_variants:
         prefix = variant + "-"
-        for key, url in index.items():
+        for key in index:
             if not key.startswith(prefix):
                 continue
             rest = key[len(prefix):]
-            # Год — это последние цифры без дефисов
             if not rest.isdigit():
                 continue
-            # Нормализуем 2-значные годы: 95 -> 1995, 02 -> 2002, 19 -> 2019
-            if len(rest) == 2:
-                y2 = int(rest)
-                year_norm = str(1900 + y2) if y2 >= 70 else str(2000 + y2)
-            else:
-                year_norm = rest
-            if year_norm not in candidates:
-                candidates[year_norm] = key
+            year_norm = _normalize_year(rest)
+            # setdefault: если один и тот же год уже встречался,
+            # оставляем ПЕРВОЕ (то есть базу, а не альтернативу)
+            candidates.setdefault(year_norm, key)
 
     if not candidates:
         return None, None, []
@@ -243,6 +222,7 @@ def find_newest_match(name: str, index: dict) -> tuple[str, str | None, list[str
     newest_year = years_sorted[-1]
     newest_key = candidates[newest_year]
     return newest_key, index[newest_key], years_sorted
+
 
 # ---------------------------------------------------------------------------
 # HTTP
@@ -300,8 +280,7 @@ def scan_section(section: int, index: dict, session: requests.Session) -> int:
             href = a_tag["href"]
             if "/Index/" not in href:
                 continue
-            link_text = a_tag.get_text(strip=True)
-            designation = extract_designation(link_text)
+            designation = extract_designation(a_tag.get_text(strip=True))
             if not designation or len(designation) < 5:
                 continue
             key = normalize_designation(designation)
@@ -350,8 +329,7 @@ def build_index(session: requests.Session, use_cache: bool = True) -> dict:
     try:
         with open(INDEX_CACHE, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False)
-        print(f"Индекс сохранён в {INDEX_CACHE} (при следующем запуске будет "
-              f"загружен из кэша).\n")
+        print(f"Индекс сохранён в {INDEX_CACHE}.\n")
     except Exception:
         pass
 
@@ -399,7 +377,8 @@ def safe_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_gost_list(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    # utf-8-sig корректно съедает BOM, если файл сохранён в Блокноте Windows
+    with open(filepath, "r", encoding="utf-8-sig") as f:
         return [line.strip() for line in f if line.strip()]
 
 
@@ -427,27 +406,29 @@ def main():
     for i, name in enumerate(gost_list, 1):
         print(f"[{i}/{len(gost_list)}] {name}")
 
-        matched_key = None
-        for variant in designation_variants(name):
-            if variant in index:
-                matched_key = variant
-                break
-
-        if matched_key and matched_key != normalize_designation(name):
-            print(f"  Найдено по альтернативному написанию: {matched_key}")
+        matched_key, page_url, all_years = find_newest_match(name, index)
 
         if not matched_key:
             print(f"  [!] Не найдено в индексе.")
-            # Подсказка: показать близкие обозначения
-            prefix = normalize_designation(name)[:12]
-            similar = [k for k in index.keys() if k.startswith(prefix)][:5]
+            base, _ = parse_designation(name)
+            prefix = base[:12]
+            similar = [k for k in index if k.startswith(prefix)][:5]
             if similar:
                 print(f"      Похожие: {', '.join(similar)}")
             failed += 1
             not_found.append(name)
             continue
 
-        page_url = index[matched_key]
+        # Информация о том, что выбрали
+        if len(all_years) > 1:
+            print(f"  Найдено: {matched_key} "
+                  f"(самый свежий из {len(all_years)}: "
+                  f"{', '.join(all_years)})")
+        elif matched_key != normalize_designation(name):
+            print(f"  Найдено (по альтернативному написанию): {matched_key}")
+        else:
+            print(f"  Найдено: {matched_key}")
+
         pdf_url = find_pdf_url(page_url, session)
         if not pdf_url:
             print(f"  [!] PDF-ссылка не найдена на {page_url}")
@@ -460,7 +441,6 @@ def main():
             success += 1
             continue
 
-        print(f"  Найдено: {matched_key}")
         if download_pdf(pdf_url, save_path, session):
             print(f"  Сохранено: {save_path}")
             success += 1
