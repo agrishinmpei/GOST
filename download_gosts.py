@@ -98,16 +98,52 @@ def extract_designation(text: str) -> str:
 
 def designation_variants(name: str) -> list[str]:
     """
-    Возвращает варианты обозначения для поиска в индексе.
-    Например, если пользователь написал "1234-56", предложит
-    также "ГОСТ 1234-56" и "ГОСТ Р 1234-56".
+    Возвращает список вариантов обозначения для поиска в индексе.
+    Учитывает:
+      - ГОСТ <-> ГОСТ Р
+      - МЭК <-> IEC
+      - ИСО <-> ISO
+      - ЕН  <-> EN
     """
     norm = normalize_designation(name)
-    variants = [norm]
-    if norm and not norm.startswith("ГОСТ"):
-        variants.append("ГОСТ " + norm)
-        variants.append("ГОСТ Р " + norm)
-    return variants
+    if not norm:
+        return []
+
+    variants = set()
+    variants.add(norm)
+
+    # 1. ГОСТ <-> ГОСТ Р
+    if norm.startswith("ГОСТ Р "):
+        variants.add(norm.replace("ГОСТ Р ", "ГОСТ ", 1))
+    elif norm.startswith("ГОСТ "):
+        variants.add(norm.replace("ГОСТ ", "ГОСТ Р ", 1))
+
+    # 2. Аббревиатуры МЭК/IEC, ИСО/ISO, ЕН/EN
+    replacements = [
+        ("МЭК", "IEC"), ("IEC", "МЭК"),
+        ("ИСО", "ISO"), ("ISO", "ИСО"),
+        ("ЕН", "EN"),  ("EN", "ЕН"),
+    ]
+
+    # Применяем замены ко всем уже накопленным вариантам
+    current = list(variants)
+    for variant in current:
+        for rus, lat in replacements:
+            if rus in variant:
+                new_variant = variant.replace(rus, lat)
+                variants.add(new_variant)
+                # и ещё раз с добавлением/удалением «Р»
+                if new_variant.startswith("ГОСТ Р "):
+                    variants.add(new_variant.replace("ГОСТ Р ", "ГОСТ ", 1))
+                elif new_variant.startswith("ГОСТ "):
+                    variants.add(new_variant.replace("ГОСТ ", "ГОСТ Р ", 1))
+
+    # 3. Если пользователь написал без префикса — добавим оба
+    if not norm.startswith("ГОСТ"):
+        variants.add("ГОСТ " + norm)
+        variants.add("ГОСТ Р " + norm)
+
+    return list(variants)
 
 
 # ---------------------------------------------------------------------------
