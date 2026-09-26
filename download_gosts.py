@@ -335,6 +335,9 @@ def main():
                 matched_key = variant
                 break
 
+        if matched_key and matched_key != normalize_designation(name):
+            print(f"  Найдено по альтернативному написанию: {matched_key}")
+
         if not matched_key:
             print(f"  [!] Не найдено в индексе.")
             # Подсказка: показать близкие обозначения
